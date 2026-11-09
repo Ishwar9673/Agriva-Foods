@@ -20,7 +20,7 @@ const orderSchema = new mongoose.Schema({
   items: [{ productId: String, sku: String, name: String, weight: String, quantity: Number, price: Number, image: String }],
   subtotal: Number, shippingFee: Number, total: Number,
   shippingCourier: String, shippingEstimate: String, parcelDetails: mongoose.Schema.Types.Mixed,
-  paymentMethod: { type: String, enum: ['Razorpay', 'COD'] },
+  paymentMethod: { type: String, enum: ['Razorpay'] },
   paymentStatus: { type: String, default: 'Pending' },
   orderStatus: { type: String, default: 'placed' },
   razorpayOrderId: String, razorpayPaymentId: String, razorpaySignature: String,

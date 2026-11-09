@@ -75,7 +75,7 @@ router.post('/logistics/quote', async (req, res, next) => {
     if (!/^\d{6}$/.test(pinCode)) return res.status(400).json({ message: 'Enter a valid 6-digit delivery PIN code.' });
     const items = await priceCart(req.body.items);
     const subtotal = subtotalFor(items);
-    const paymentMethod = String(req.body.paymentMethod || 'Prepaid').toLowerCase() === 'cod' ? 'COD' : 'Prepaid';
+    const paymentMethod = 'Prepaid';
     const parcel = buildParcel(items);
     const serviceability = await checkPincode(pinCode);
     if (!serviceability.serviceable) return res.status(422).json({ message: 'Delivery is not available for this PIN code.' });
@@ -139,32 +139,7 @@ router.post('/payment/verify', async (req, res, next) => {
   } catch (e) { next(e); }
 });
 
-router.post('/orders', async (req, res, next) => {
-  try {
-    const items = await priceCart(req.body.items);
-    const subtotal = subtotalFor(items);
-    const pinCode = String((req.body.shippingAddress || {}).pinCode || '').trim();
-    if (!/^\d{6}$/.test(pinCode)) return res.status(400).json({ message: 'Please enter a valid 6-digit delivery PIN code.' });
-    const parcel = buildParcel(items);
-    const serviceability = await checkPincode(pinCode);
-    if (!serviceability.serviceable) return res.status(422).json({ message: 'Delivery is not available for this PIN code.' });
-    const shipping = await getShippingQuote({ pinCode, parcel, paymentMethod: 'COD', productMrp: subtotal });
-    const shippingFee = shipping.shippingFee;
-    const total = subtotal + shippingFee;
-    const customer = req.body.customer || {};
-    const shippingAddress = req.body.shippingAddress || {};
-    if (!customer.fullName || !customer.email || !customer.phone || !shippingAddress.address || !shippingAddress.city || !shippingAddress.state || !shippingAddress.pinCode) {
-      return res.status(400).json({ message: 'Please provide complete customer and delivery details.' });
-    }
-    const order = await Order.create({
-      orderNumber: orderNo(), customer, shippingAddress, items, subtotal, shippingFee, total,
-      paymentMethod: 'COD', paymentStatus: 'Pending', orderStatus: 'placed'
-    });
-    await decrementStock(order);
-    await order.save();
-    res.status(201).json({ success: true, data: { order } });
-  } catch (e) { next(e); }
-});
+router.post('/orders', (_req, res) => res.status(410).json({ message: 'Cash on Delivery is no longer available. Please pay online using Razorpay.' }));
 router.get('/orders/track/:orderNumber', async (req, res, next) => {
   try {
     const order = await Order.findOne({ orderNumber: req.params.orderNumber }).select('orderNumber orderStatus paymentStatus trackingNumber createdAt');
