@@ -9,7 +9,7 @@ import { fileURLToPath } from 'url';
 import fs from 'fs';
 import { Product, Order, Admin, Category, StoreSetting } from '../models/index.js';
 import { requireAdmin } from '../middleware/auth.js';
-import { checkPincode, getShippingRates, trackAwb } from '../services/ithinkLogistics.js';
+import { getShippingQuote, checkPincode, buildParcel } from '../services/ithinkService.js';
 
 const router = express.Router();
 const uploadDir = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../../uploads');
@@ -50,53 +50,12 @@ async function decrementStock(order) {
   }
   order.stockAdjusted = true;
 }
-async function totals(items, pinCode, paymentMethod) {
-  const subtotal = items.reduce((sum, item) => sum + item.price * item.quantity, 0);
-  let shippingFee;
-  if (process.env.ITHINK_ACCESS_TOKEN && process.env.ITHINK_SECRET_KEY) {
-    if (!/^\\d{6}$/.test(String(pinCode || ''))) {
-      const error = new Error('A valid delivery PIN code is required to calculate shipping.');
-      error.status = 400;
-      throw error;
-    }
-    const quote = await getShippingRates({ toPincode: pinCode, paymentMethod, subtotal });
-    shippingFee = quote.shippingFee;
-  } else {
-    shippingFee = subtotal >= Number(process.env.FREE_SHIPPING_THRESHOLD || 499) ? 0 : Number(process.env.SHIPPING_FEE || 49);
-  }
-  return { subtotal, shippingFee, total: subtotal + shippingFee };
+function subtotalFor(items) {
+  return items.reduce((sum, item) => sum + item.price * item.quantity, 0);
 }
 
 // Public storefront APIs
 router.get('/health', (_req, res) => res.json({ success: true, data: { uptime: process.uptime(), database: 'connected' }, service: 'AgrivaFoods API' }));
-router.post('/logistics/pincode-check', async (req, res, next) => {
-  try {
-    const pincode = String(req.body.pincode || '').trim();
-    if (!/^\d{6}$/.test(pincode)) return res.status(400).json({ message: 'Enter a valid 6-digit PIN code.' });
-    const result = await checkPincode(pincode);
-    if (!result.success) return res.status(422).json({ success: false, serviceable: false, message: 'This PIN code is not serviceable.' });
-    res.json({ success: true, serviceable: true });
-  } catch (e) { next(e); }
-});
-router.post('/logistics/rate', async (req, res, next) => {
-  try {
-    const pincode = String(req.body.pincode || '').trim();
-    if (!/^\d{6}$/.test(pincode)) return res.status(400).json({ message: 'Enter a valid 6-digit PIN code.' });
-    const quote = await getShippingRates({
-      toPincode: pincode, paymentMethod: req.body.paymentMethod,
-      subtotal: Number(req.body.subtotal || 0)
-    });
-    res.json({ success: true, data: quote });
-  } catch (e) { next(e); }
-});
-router.post('/logistics/track', async (req, res, next) => {
-  try {
-    const awb = String(req.body.awbNumber || '').trim();
-    if (!awb) return res.status(400).json({ message: 'AWB number is required.' });
-    const data = await trackAwb(awb);
-    res.json({ success: true, data });
-  } catch (e) { next(e); }
-});
 router.get('/products', async (_req, res, next) => {
   try { const products = await Product.find({ isActive: true, status: 'published' }).sort({ legacyId: 1 }); res.json({ success: true, data: products }); }
   catch (e) { next(e); }
@@ -109,13 +68,38 @@ router.get('/products/:id', async (req, res, next) => {
   try { const p = await Product.findById(req.params.id); if (!p) return res.status(404).json({ message: 'Product not found' }); res.json({ success: true, data: p }); }
   catch (e) { next(e); }
 });
+// iThink Logistics: quotes are always calculated on the server; never accept a client shipping price.
+router.post('/logistics/quote', async (req, res, next) => {
+  try {
+    const pinCode = String(req.body.pinCode || '').trim();
+    if (!/^\d{6}$/.test(pinCode)) return res.status(400).json({ message: 'Enter a valid 6-digit delivery PIN code.' });
+    const items = await priceCart(req.body.items);
+    const subtotal = subtotalFor(items);
+    const paymentMethod = String(req.body.paymentMethod || 'Prepaid').toLowerCase() === 'cod' ? 'COD' : 'Prepaid';
+    const parcel = buildParcel(items);
+    const serviceability = await checkPincode(pinCode);
+    if (!serviceability.serviceable) return res.status(422).json({ message: 'Delivery is not available for this PIN code.' });
+    const quote = await getShippingQuote({ pinCode, parcel, paymentMethod, productMrp: subtotal });
+    res.json({ success: true, data: { shippingFee: quote.shippingFee, courier: quote.courier, estimatedDays: quote.estimatedDays, parcel } });
+  } catch (e) { next(e); }
+});
+
 router.get('/payment/config', (_req, res) => res.json({ success: true, data: { onlinePaymentEnabled: razorpayReady(), keyId: process.env.RAZORPAY_KEY_ID || '' } }));
 
 router.post('/payment/create-order', async (req, res, next) => {
   try {
     if (!razorpayReady()) return res.status(503).json({ message: 'Online payments are not configured. Add Razorpay keys in Hostinger environment variables.' });
     const items = await priceCart(req.body.items);
-    const { subtotal, shippingFee, total } = await totals(items, req.body.shippingAddress?.pinCode, 'Prepaid');
+    const subtotal = subtotalFor(items);
+    const pinCode = String((req.body.shippingAddress || {}).pinCode || '').trim();
+    if (!/^\d{6}$/.test(pinCode)) return res.status(400).json({ message: 'Please enter a valid 6-digit delivery PIN code.' });
+    const paymentMethod = 'Prepaid';
+    const parcel = buildParcel(items);
+    const serviceability = await checkPincode(pinCode);
+    if (!serviceability.serviceable) return res.status(422).json({ message: 'Delivery is not available for this PIN code.' });
+    const shipping = await getShippingQuote({ pinCode, parcel, paymentMethod, productMrp: subtotal });
+    const shippingFee = shipping.shippingFee;
+    const total = subtotal + shippingFee;
     const customer = req.body.customer || {};
     const shippingAddress = req.body.shippingAddress || {};
     if (!customer.fullName || !customer.email || !customer.phone || !shippingAddress.address || !shippingAddress.city || !shippingAddress.state || !shippingAddress.pinCode) {
@@ -158,7 +142,15 @@ router.post('/payment/verify', async (req, res, next) => {
 router.post('/orders', async (req, res, next) => {
   try {
     const items = await priceCart(req.body.items);
-    const { subtotal, shippingFee, total } = await totals(items, req.body.shippingAddress?.pinCode, 'COD');
+    const subtotal = subtotalFor(items);
+    const pinCode = String((req.body.shippingAddress || {}).pinCode || '').trim();
+    if (!/^\d{6}$/.test(pinCode)) return res.status(400).json({ message: 'Please enter a valid 6-digit delivery PIN code.' });
+    const parcel = buildParcel(items);
+    const serviceability = await checkPincode(pinCode);
+    if (!serviceability.serviceable) return res.status(422).json({ message: 'Delivery is not available for this PIN code.' });
+    const shipping = await getShippingQuote({ pinCode, parcel, paymentMethod: 'COD', productMrp: subtotal });
+    const shippingFee = shipping.shippingFee;
+    const total = subtotal + shippingFee;
     const customer = req.body.customer || {};
     const shippingAddress = req.body.shippingAddress || {};
     if (!customer.fullName || !customer.email || !customer.phone || !shippingAddress.address || !shippingAddress.city || !shippingAddress.state || !shippingAddress.pinCode) {
