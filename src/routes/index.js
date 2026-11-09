@@ -9,6 +9,7 @@ import { fileURLToPath } from 'url';
 import fs from 'fs';
 import { Product, Order, Admin, Category, StoreSetting } from '../models/index.js';
 import { requireAdmin } from '../middleware/auth.js';
+import { checkPincode, getShippingRates, trackAwb } from '../services/ithinkLogistics.js';
 
 const router = express.Router();
 const uploadDir = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../../uploads');
@@ -49,14 +50,53 @@ async function decrementStock(order) {
   }
   order.stockAdjusted = true;
 }
-function totals(items) {
+async function totals(items, pinCode, paymentMethod) {
   const subtotal = items.reduce((sum, item) => sum + item.price * item.quantity, 0);
-  const shippingFee = subtotal >= Number(process.env.FREE_SHIPPING_THRESHOLD || 499) ? 0 : Number(process.env.SHIPPING_FEE || 49);
+  let shippingFee;
+  if (process.env.ITHINK_ACCESS_TOKEN && process.env.ITHINK_SECRET_KEY) {
+    if (!/^\\d{6}$/.test(String(pinCode || ''))) {
+      const error = new Error('A valid delivery PIN code is required to calculate shipping.');
+      error.status = 400;
+      throw error;
+    }
+    const quote = await getShippingRates({ toPincode: pinCode, paymentMethod, subtotal });
+    shippingFee = quote.shippingFee;
+  } else {
+    shippingFee = subtotal >= Number(process.env.FREE_SHIPPING_THRESHOLD || 499) ? 0 : Number(process.env.SHIPPING_FEE || 49);
+  }
   return { subtotal, shippingFee, total: subtotal + shippingFee };
 }
 
 // Public storefront APIs
 router.get('/health', (_req, res) => res.json({ success: true, data: { uptime: process.uptime(), database: 'connected' }, service: 'AgrivaFoods API' }));
+router.post('/logistics/pincode-check', async (req, res, next) => {
+  try {
+    const pincode = String(req.body.pincode || '').trim();
+    if (!/^\d{6}$/.test(pincode)) return res.status(400).json({ message: 'Enter a valid 6-digit PIN code.' });
+    const result = await checkPincode(pincode);
+    if (!result.success) return res.status(422).json({ success: false, serviceable: false, message: 'This PIN code is not serviceable.' });
+    res.json({ success: true, serviceable: true });
+  } catch (e) { next(e); }
+});
+router.post('/logistics/rate', async (req, res, next) => {
+  try {
+    const pincode = String(req.body.pincode || '').trim();
+    if (!/^\d{6}$/.test(pincode)) return res.status(400).json({ message: 'Enter a valid 6-digit PIN code.' });
+    const quote = await getShippingRates({
+      toPincode: pincode, paymentMethod: req.body.paymentMethod,
+      subtotal: Number(req.body.subtotal || 0)
+    });
+    res.json({ success: true, data: quote });
+  } catch (e) { next(e); }
+});
+router.post('/logistics/track', async (req, res, next) => {
+  try {
+    const awb = String(req.body.awbNumber || '').trim();
+    if (!awb) return res.status(400).json({ message: 'AWB number is required.' });
+    const data = await trackAwb(awb);
+    res.json({ success: true, data });
+  } catch (e) { next(e); }
+});
 router.get('/products', async (_req, res, next) => {
   try { const products = await Product.find({ isActive: true, status: 'published' }).sort({ legacyId: 1 }); res.json({ success: true, data: products }); }
   catch (e) { next(e); }
@@ -75,7 +115,7 @@ router.post('/payment/create-order', async (req, res, next) => {
   try {
     if (!razorpayReady()) return res.status(503).json({ message: 'Online payments are not configured. Add Razorpay keys in Hostinger environment variables.' });
     const items = await priceCart(req.body.items);
-    const { subtotal, shippingFee, total } = totals(items);
+    const { subtotal, shippingFee, total } = await totals(items, req.body.shippingAddress?.pinCode, 'Prepaid');
     const customer = req.body.customer || {};
     const shippingAddress = req.body.shippingAddress || {};
     if (!customer.fullName || !customer.email || !customer.phone || !shippingAddress.address || !shippingAddress.city || !shippingAddress.state || !shippingAddress.pinCode) {
@@ -118,7 +158,7 @@ router.post('/payment/verify', async (req, res, next) => {
 router.post('/orders', async (req, res, next) => {
   try {
     const items = await priceCart(req.body.items);
-    const { subtotal, shippingFee, total } = totals(items);
+    const { subtotal, shippingFee, total } = await totals(items, req.body.shippingAddress?.pinCode, 'COD');
     const customer = req.body.customer || {};
     const shippingAddress = req.body.shippingAddress || {};
     if (!customer.fullName || !customer.email || !customer.phone || !shippingAddress.address || !shippingAddress.city || !shippingAddress.state || !shippingAddress.pinCode) {
